@@ -52,7 +52,6 @@ export K3_MAX_MODEL_LEN=16384
 export K3_MAX_NUM_SEQS=64
 export K3_MAX_NUM_BATCHED_TOKENS=10240
 export K3_GMU=0.93
-export K3_LEVEL=0
 
 cd "$ATOM_DIR"
 exec /opt/venv/bin/python -m atom.entrypoints.openai_server \
@@ -65,4 +64,4 @@ exec /opt/venv/bin/python -m atom.entrypoints.openai_server \
   --gpu-memory-utilization "${K3_GMU:-0.93}" \
   --server-port "${K3_PORT:-8000}" \
   --block-size 128 \
-  --no-enable_prefix_caching 
+  --no-enable_prefix_caching 2>&1 | tee k3_mi355_tp8_cudagraph.log &
