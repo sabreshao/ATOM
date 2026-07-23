@@ -41,6 +41,9 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from atom.model_ops.fla_ops.fused_sigmoid_gating import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
@@ -704,6 +707,11 @@ class KimiKDAAttention(nn.Module):
 
         self.A_log = atom_parameter(torch.empty(self.num_local_heads))
         self.dt_bias = atom_parameter(torch.empty(self.local_proj_size))
+        # Lower bound of the KDA forget gate (Kimi uses -5.0). Consumed by both
+        # the fla prefill path (_run_kda) and the fused decode kernel.
+        self._kda_gate_lower_bound = (
+            getattr(config, "linear_attn_config", {}) or {}
+        ).get("gate_lower_bound", None)
         loader = _sharded_vector_loader(self.tp_rank, self.tp_size)
         self.A_log.weight_loader = loader
         self.dt_bias.weight_loader = loader
@@ -732,9 +740,52 @@ class KimiKDAAttention(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        """Pre-concatenate the static q/k/v causal-conv weights."""
-        if hasattr(self, "conv_weight"):
+        """Fuse all hidden-input projections into the single in-proj (one GEMM).
+
+        Upstream already loads q/k/v/g into a single ``in_proj``
+        (``MergedColumnParallelLinear``) via ``packed_modules_mapping``. Here we
+        extend that fused weight in place with the two remaining projections that
+        also consume ``hidden_states`` -- ``b_proj`` (beta) and ``f_a_proj`` --
+        so ``forward`` runs one ``self.in_proj(...)`` producing
+        ``[q | k | v | g | b | f_a]`` instead of three separate launches. The
+        tail storage is then released (the modules stay as empty shells; their
+        bf16 post-load hooks are no-ops and never re-run). Runs once; idempotent.
+
+        f_b_proj is NOT fused: it consumes ``f_a_proj``'s output, not
+        ``hidden_states``, so it is a data-dependent second GEMM and cannot ride
+        the same launch.
+
+        Fused output width is ``4*local_proj + num_local_heads + head_dim``. The
+        two small tails (``b`` = num_local_heads, ``f_a`` = head_dim) make N a
+        non-multiple of the GEMM tile, so the fused shape may fall back to an
+        untuned tgemm config until one is tuned for it; the saved launches
+        dominate on the launch-bound decode path.
+
+        Assumes bf16 (unquantized) attention weights, which the Kimi-K3
+        checkpoint guarantees (``re:.*self_attn.*`` is in the quant ignore
+        list). A quantized-attention checkpoint would need per-shard scale
+        handling and is rejected loudly rather than silently mis-fused.
+        """
+        if getattr(self, "_in_proj_fused", False):
             return
+        # Order defines the forward-time slice boundaries below; keep in sync.
+        # in_proj already holds the fused [q | k | v | g] (4 * local_proj_size);
+        # b_proj and f_a_proj are appended as the two tails.
+        tails = (self.b_proj, self.f_a_proj)
+        assert all(m.quant_type == QuantType.No for m in (self.in_proj, *tails)), (
+            "KDA in-proj fusion assumes unquantized (bf16) attention weights; "
+            "this checkpoint quantizes self_attn projections."
+        )
+        fused = torch.cat(
+            [self.in_proj.weight.data, *[m.weight.data for m in tails]], dim=0
+        ).contiguous()
+        # Grow in_proj's weight in place so the existing module (and its
+        # unquantized tgemm.mm path) produces the wide fused output directly.
+        self.in_proj.weight = nn.Parameter(fused, requires_grad=False)
+        # Release the tail weight storage. The modules stay as empty shells;
+        # their bf16 post-load hooks are no-ops and are never re-run.
+        for m in tails:
+            m.weight.data = m.weight.data.new_empty(0)
 
         # Pre-concatenate the static q/k/v causal-conv weights once here instead
         # of rebuilding the [3*local_proj_size, K] tensor on every forward.
@@ -746,6 +797,7 @@ class KimiKDAAttention(nn.Module):
             ],
             dim=0,
         ).contiguous()
+        self._in_proj_fused = True
 
     def _conv_weights(self) -> torch.Tensor:
         return self.conv_weight
@@ -782,13 +834,8 @@ class KimiKDAAttention(nn.Module):
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             use_beta_sigmoid_in_kernel=True,
-            safe_gate=getattr(self.config, "linear_attn_config", {}).get(
-                "gate_lower_bound", None
-            )
-            is not None,
-            lower_bound=getattr(self.config, "linear_attn_config", {}).get(
-                "gate_lower_bound", None
-            ),
+            safe_gate=self._kda_gate_lower_bound is not None,
+            lower_bound=self._kda_gate_lower_bound,
             transpose_state_layout=True,
             cu_seqlens=cu_seqlens,
         )
@@ -819,23 +866,28 @@ class KimiKDAAttention(nn.Module):
         # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
         # part. `out_gate` is the KDA output gate consumed at o_norm below
         # (computed here so it rides the same GEMM instead of a separate one
-        # after the recurrence). Routed through tgemm (aiter's tunable GEMM
-        # path) so the fused shape can pick up a tuned config; N = 4*local_proj
-        # is a clean multiple of the GEMM tile (b_proj's tiny num_heads width is
-        # kept out so it does not misalign N).
+        # after the recurrence). in_proj's weight was grown in
+        # process_weights_after_loading to the fused [q | k | v | g | b | f_a],
+        # so this single unquantized call emits all six; f_b_proj stays a
+        # separate GEMM because it consumes f_a's output, not hidden_states.
         lp = self.local_proj_size
+        nlh = self.num_local_heads
+        hd = self.head_dim
         fused_in = self.in_proj(hidden_states)
         # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
-        # row stride 4*lp). Both causal-conv consumers read the token stride from
-        # the tensor itself — causal_conv1d_fn uses x.stride(1) after transpose
-        # (channel-last: stride(0)==1), and causal_conv1d_update only requires
-        # x.stride(1)==1 (feature-contiguous, which the slice preserves).
+        # row stride N_fused). Both causal-conv consumers read the token stride
+        # from the tensor itself — causal_conv1d_fn uses x.stride(1) after
+        # transpose (channel-last: stride(0)==1), and causal_conv1d_update only
+        # requires x.stride(1)==1 (feature-contiguous, which the slice preserves).
         mixed_qkv = fused_in[..., : 3 * lp]
         out_gate = fused_in[..., 3 * lp : 4 * lp]
         # beta is widened to fp32 inside _run_kda (see the note there): the KDA
         # delta-rule write strength must stay fp32 for accuracy.
-        beta = self.b_proj(hidden_states).unsqueeze(0)
-        gate = self.f_b_proj(self.f_a_proj(hidden_states))
+        beta = fused_in[..., 4 * lp : 4 * lp + nlh].unsqueeze(0)
+        # f_a feeds a second GEMM (f_b_proj); make it contiguous so tgemm sees a
+        # unit row stride rather than the fused output's N_fused stride.
+        f_a = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd].contiguous()
+        gate = self.f_b_proj(f_a)
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
         out = hidden_states.new_empty(
             (num_actual_tokens, self.num_local_heads, self.head_dim)
@@ -894,8 +946,8 @@ class KimiKDAAttention(nn.Module):
             ssm_state[state_indices] = last_state
             out.copy_(kda_out.squeeze(0))
         elif gdn_metadata.num_decodes > 0:
-            # Slice the per-token cache-slot indices once (was recomputed for
-            # the conv update, the state gather, and the state scatter-back).
+            # Slice the per-token cache-slot indices once (used for both the
+            # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
@@ -911,30 +963,31 @@ class KimiKDAAttention(nn.Module):
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            # Advanced indexing already returns a contiguous tensor, so no
-            # .contiguous() is needed. CUDA-graph decode pads the batch to the
-            # captured size with PAD_SLOT_ID (-1) state indices; the gather here
-            # harmlessly reads the last slot for padded rows (the values feed
-            # only the padded output rows, which are discarded). The scatter-back
-            # below, however, MUST skip padded rows -- see scatter_kda_state.
-            from atom.models.kimi_k3_fused import scatter_kda_state
-
-            initial = ssm_state[decode_state_indices]
-            kda_out, last_state = self._run_kda(
-                q,
-                k,
-                v,
-                gate,
-                beta,
-                initial,
-                query_start_loc[: gdn_metadata.num_decodes + 1],
-                True,
-                recurrent=True,
+            # Fused KDA decode: the kernel gathers the initial state from
+            # ssm_state[decode_state_indices], writes the final state back to
+            # the same slots inplace (inplace_final_state), and writes the
+            # recurrence output straight into `out`. This folds the manual
+            # gather / scatter-back / out.copy_ that the fla path required into
+            # one kernel. is_kda + lower_bound select the per-K-channel,
+            # lower-bounded sigmoid gate that Kimi-KDA uses (beta stays raw
+            # logits; the kernel applies sigmoid in fp32 internally).
+            fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log,
+                a=gate,
+                b=beta,
+                dt_bias=self.dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                o=out,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=query_start_loc[: gdn_metadata.num_decodes + 1],
+                ssm_state_indices=decode_state_indices,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=True,
+                lower_bound=self._kda_gate_lower_bound,
             )
-            # Pad-aware writeback: -1 rows are skipped so they never overwrite an
-            # active request's state slot (PyTorch `ssm_state[-1] = ...` would).
-            scatter_kda_state(ssm_state, decode_state_indices, last_state)
-            out.copy_(kda_out.squeeze(0))
         else:
             out.zero_()
 

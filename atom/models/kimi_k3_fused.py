@@ -65,21 +65,30 @@ if _HAS_TRITON:
         y_ptr,
         H,
         eps,
-        stride_m,
+        stride_xm,
+        stride_ym,
+        stride_g_outer,
+        stride_g_head,
+        HEADS: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         row = tl.program_id(0)
         cols = tl.arange(0, BLOCK)
         mask = cols < H
-        x = tl.load(x_ptr + row * stride_m + cols, mask=mask, other=0.0).to(tl.float32)
+        # x / y are row-contiguous [M, H]; gate may be strided. Its logical row
+        # `row` decomposes into (outer, head) so the token-boundary jump
+        # (stride_g_outer) and per-head step (stride_g_head) are read directly,
+        # avoiding a contiguous copy of the strided gate slice.
+        g_off = (row // HEADS) * stride_g_outer + (row % HEADS) * stride_g_head + cols
+        x = tl.load(x_ptr + row * stride_xm + cols, mask=mask, other=0.0).to(tl.float32)
         var = tl.sum(x * x, axis=0) / H
         rstd = 1.0 / tl.sqrt(var + eps)
         w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        gate = tl.load(g_ptr + row * stride_m + cols, mask=mask, other=0.0).to(
-            tl.float32
-        )
+        gate = tl.load(g_ptr + g_off, mask=mask, other=0.0).to(tl.float32)
         y = (x * rstd * w) * tl.sigmoid(gate)
-        tl.store(y_ptr + row * stride_m + cols, y.to(y_ptr.dtype.element_ty), mask=mask)
+        tl.store(
+            y_ptr + row * stride_ym + cols, y.to(y_ptr.dtype.element_ty), mask=mask
+        )
 
 
 if _HAS_TRITON:
@@ -246,25 +255,40 @@ def situ_and_mul(
 def rmsnorm_gated(
     x: torch.Tensor, weight: torch.Tensor, gate: torch.Tensor, eps: float
 ) -> torch.Tensor:
-    """rmsnorm(x) over last dim * weight * sigmoid(gate)."""
+    """rmsnorm(x) over last dim * weight * sigmoid(gate).
+
+    ``gate`` may be strided (e.g. a column slice of a fused GEMM output): the
+    kernel reads it via (outer, head) strides so no contiguous copy is needed.
+    ``x`` is normed row-wise and is made contiguous (cheap; the caller's ``out``
+    already is). Supports a 2D ``[M, H]`` or 3D ``[outer, heads, H]`` gate.
+    """
     h = x.shape[-1]
     x2 = x.reshape(-1, h)
-    g2 = gate.reshape(-1, h)
     m = x2.shape[0]
     if not _HAS_TRITON or m == 0 or h > 8192:
         return _rmsnorm_gated_torch(x, weight, gate, eps)
+    if gate.ndim == 3:
+        heads = gate.shape[1]
+        stride_g_outer, stride_g_head = gate.stride(0), gate.stride(1)
+    else:
+        # 2D: one logical head per row; the head term drops out (row % 1 == 0).
+        heads = 1
+        stride_g_outer, stride_g_head = gate.stride(0), 0
     x2 = x2.contiguous()
-    g2 = g2.contiguous()
     y = torch.empty_like(x2)
     BLOCK = triton.next_power_of_2(h)
     _rmsnorm_gated_kernel[(m,)](
         x2,
         weight,
-        g2,
+        gate,
         y,
         h,
         float(eps),
         x2.stride(0),
+        y.stride(0),
+        stride_g_outer,
+        stride_g_head,
+        HEADS=heads,
         BLOCK=BLOCK,
     )
     return y.reshape_as(x)
@@ -468,67 +492,3 @@ def fuse_mla_kv(
     )
     return k, v_padded
 
-
-# --------------------------------------------------------------------------- #
-# KDA recurrent-state scatter-back (pad-aware)                                 #
-# --------------------------------------------------------------------------- #
-if _HAS_TRITON:
-
-    @triton.jit
-    def _scatter_kda_state_kernel(
-        dst_ptr,  # ssm_state viewed as [num_slots, S]
-        idx_ptr,  # state_indices [N]
-        src_ptr,  # last_state viewed as [N, S]
-        S,
-        stride_dst,
-        stride_src,
-        BLOCK: tl.constexpr,
-    ):
-        seq = tl.program_id(0)
-        # Skip padding rows: PAD_SLOT_ID (-1) rows must not write, so they never
-        # alias an active request's slot. Masking the store (not just clamping
-        # the index) means padded rows write nothing at all.
-        idx = tl.load(idx_ptr + seq)
-        keep = idx >= 0
-        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-        mask = (offs < S) & keep
-        vals = tl.load(src_ptr + seq * stride_src + offs, mask=mask, other=0.0)
-        safe_idx = tl.where(keep, idx, 0).to(tl.int64)
-        tl.store(dst_ptr + safe_idx * stride_dst + offs, vals, mask=mask)
-
-
-def scatter_kda_state(
-    ssm_state: torch.Tensor,
-    state_indices: torch.Tensor,
-    src: torch.Tensor,
-) -> None:
-    """Scatter ``src`` rows into ``ssm_state[state_indices]``, skipping padded
-    rows (``state_indices < 0`` / PAD_SLOT_ID) entirely.
-
-    CUDA-graph decode pads the batch to the captured size and fills the padded
-    state indices with -1. PyTorch advanced-index assignment treats -1 as the
-    last slot, so a padded row would overwrite (and corrupt) whichever active
-    request owns it. Skipping the write in-kernel -- like causal_conv1d does --
-    keeps padded rows off every real slot without an extra scratch slot, and is
-    graph-safe (fixed shapes, per-row masked store). Torch fallback (a masked
-    scatter, used only under eager) when triton is unavailable.
-    """
-    n = int(state_indices.shape[0])
-    if not _HAS_TRITON or n == 0:
-        valid = state_indices >= 0
-        ssm_state[state_indices[valid]] = src[valid]
-        return
-    dst = ssm_state.reshape(ssm_state.shape[0], -1)
-    src2 = src.reshape(n, -1)
-    S = dst.shape[1]
-    BLOCK = 1024
-    grid = (n, triton.cdiv(S, BLOCK))
-    _scatter_kda_state_kernel[grid](
-        dst,
-        state_indices,
-        src2,
-        S,
-        dst.stride(0),
-        src2.stride(0),
-        BLOCK=BLOCK,
-    )
