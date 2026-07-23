@@ -24,7 +24,7 @@ set -euo pipefail
 MODEL="${K3_MODEL:-/shared/data/amd_int/models/xiaobing/Minimax-m3-xiaobing}"
 PORT="${K3_PORT:-8000}"
 NUM_FEWSHOT="${K3_NUM_FEWSHOT:-5}"
-NUM_CONCURRENT="${K3_NUM_CONCURRENT:-16}"
+NUM_CONCURRENT="${K3_NUM_CONCURRENT:-64}"
 
 LIMIT_ARG=()
 if [[ -n "${K3_LIMIT:-}" ]]; then
