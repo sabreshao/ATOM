@@ -91,6 +91,5 @@ exec python -m atom.entrypoints.openai_server \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --level 0 \
   --no-enable_prefix_caching \
-  --no-enable_chunked_prefill \
   "${EAGER_FLAG[@]}" \
   "${EXTRA_ARGS[@]}"
