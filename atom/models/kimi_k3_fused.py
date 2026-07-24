@@ -100,7 +100,6 @@ if _HAS_TRITON:
         sw_ptr,
         y_ptr,
         hs_ptr,
-        hs2_ptr,
         pref_ptr,
         B,
         Bp,
@@ -111,13 +110,11 @@ if _HAS_TRITON:
         stride_ps_t,
         stride_yt,
         stride_hs_t,
-        stride_hs2_t,
         stride_pref_t,
         BP: tl.constexpr,  # Bp padded to a power of 2 (vectorized candidate axis)
         BLOCK_H: tl.constexpr,
         NS: tl.constexpr,  # num_stages for the H-loop software pipeline
         DO_ADD: tl.constexpr,  # fold prefix += hidden_states on-load
-        DO_ADD2: tl.constexpr,  # fold a second pending addend on-load
         WRITE_PREF: tl.constexpr,  # write the (summed) prefix back to pref_ptr
     ):
         # One program per row t: rmsnorm each of the Bp = B+1 candidates, score =
@@ -164,10 +161,6 @@ if _HAS_TRITON:
                 ps += tl.load(
                     hs_ptr + t * stride_hs_t + cols, mask=h_mask, other=0.0
                 ).to(tl.float32)
-            if DO_ADD2:
-                ps += tl.load(
-                    hs2_ptr + t * stride_hs2_t + cols, mask=h_mask, other=0.0
-                ).to(tl.float32)
             if WRITE_PREF:
                 tl.store(
                     pref_ptr + t * stride_pref_t + cols,
@@ -201,10 +194,6 @@ if _HAS_TRITON:
                 ps += tl.load(
                     hs_ptr + t * stride_hs_t + cols, mask=h_mask, other=0.0
                 ).to(tl.float32)
-            if DO_ADD2:
-                ps += tl.load(
-                    hs2_ptr + t * stride_hs2_t + cols, mask=h_mask, other=0.0
-                ).to(tl.float32)
             v = tl.where(is_last[:, None], ps[None, :], br)
             out = tl.sum(probs[:, None] * v, axis=0)  # [BLOCK_H]
             tl.store(
@@ -221,7 +210,6 @@ if _HAS_TRITON:
         psq_ptr,
         pdot_ptr,
         hs_ptr,
-        hs2_ptr,
         pref_ptr,
         B,
         H,
@@ -232,13 +220,11 @@ if _HAS_TRITON:
         stride_o_t,
         stride_o_s,
         stride_hs_t,
-        stride_hs2_t,
         stride_pref_t,
         BP: tl.constexpr,
         BLOCK_H: tl.constexpr,
         NS: tl.constexpr,
         DO_ADD: tl.constexpr,
-        DO_ADD2: tl.constexpr,
         WRITE_PREF: tl.constexpr,
     ):
         # Split-H stage 1, grid=(T, S): S workgroups cooperate on one row t, each
@@ -272,10 +258,6 @@ if _HAS_TRITON:
                 ps += tl.load(
                     hs_ptr + t * stride_hs_t + cols, mask=h_mask, other=0.0
                 ).to(tl.float32)
-            if DO_ADD2:
-                ps += tl.load(
-                    hs2_ptr + t * stride_hs2_t + cols, mask=h_mask, other=0.0
-                ).to(tl.float32)
             if WRITE_PREF:
                 tl.store(
                     pref_ptr + t * stride_pref_t + cols,
@@ -298,7 +280,6 @@ if _HAS_TRITON:
         pdot_ptr,
         y_ptr,
         hs_ptr,
-        hs2_ptr,
         B,
         Bp,
         H,
@@ -311,12 +292,10 @@ if _HAS_TRITON:
         stride_i_s,
         stride_yt,
         stride_hs_t,
-        stride_hs2_t,
         BP: tl.constexpr,
         BLOCK_H: tl.constexpr,
         NS: tl.constexpr,
         DO_ADD: tl.constexpr,
-        DO_ADD2: tl.constexpr,
     ):
         # Split-H stage 2, grid=(T,): sum the S partials back to the full
         # H-reduction (associative, so exact), then the identical softmax +
@@ -350,10 +329,6 @@ if _HAS_TRITON:
             if DO_ADD:
                 ps += tl.load(
                     hs_ptr + t * stride_hs_t + cols, mask=h_mask, other=0.0
-                ).to(tl.float32)
-            if DO_ADD2:
-                ps += tl.load(
-                    hs2_ptr + t * stride_hs2_t + cols, mask=h_mask, other=0.0
                 ).to(tl.float32)
             v = tl.where(is_last[:, None], ps[None, :], br)
             out = tl.sum(probs[:, None] * v, axis=0)
@@ -400,7 +375,6 @@ def _apply_attn_res_impl(
     score_weight: torch.Tensor,  # [H] (norm_weight * proj_weight, precomputed)
     eps: float,
     add_hidden: torch.Tensor | None = None,  # [T, H], folded: prefix += add_hidden
-    add_hidden_2: torch.Tensor | None = None,  # optional second folded addend
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Block-residual soft-attention mix: rmsnorm each of the B+1 candidates,
     score = <normed, score_weight>, softmax over B+1, weighted sum.
@@ -421,8 +395,6 @@ def _apply_attn_res_impl(
     T, B, H = block_residual.shape
     Bp = B + 1
     do_add = add_hidden is not None
-    do_add_2 = add_hidden_2 is not None
-    assert not do_add_2 or do_add
     br = block_residual.contiguous()
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
@@ -435,7 +407,6 @@ def _apply_attn_res_impl(
     else:
         hs = ps
         pref = ps
-    hs2 = add_hidden_2.contiguous() if do_add_2 else ps
     BP = triton.next_power_of_2(Bp)
     BLOCK_H = _ATTN_RES_BLOCK_H
     nchunk = triton.cdiv(H, BLOCK_H)
@@ -453,7 +424,6 @@ def _apply_attn_res_impl(
             psq,
             pdot,
             hs,
-            hs2,
             pref,
             B,
             H,
@@ -464,14 +434,12 @@ def _apply_attn_res_impl(
             psq.stride(0),
             psq.stride(1),
             hs.stride(0),
-            hs2.stride(0),
             pref.stride(0),
             BP=BP,
             BLOCK_H=BLOCK_H,
             NS=ns,
             num_warps=nw,
             DO_ADD=do_add,
-            DO_ADD2=do_add_2,
             WRITE_PREF=do_add,
         )
         _attn_res_combine_kernel[(T,)](
@@ -481,7 +449,6 @@ def _apply_attn_res_impl(
             pdot,
             y,
             hs,
-            hs2,
             B,
             Bp,
             H,
@@ -494,13 +461,11 @@ def _apply_attn_res_impl(
             psq.stride(1),
             y.stride(0),
             hs.stride(0),
-            hs2.stride(0),
             BP=BP,
             BLOCK_H=BLOCK_H,
             NS=ns,
             num_warps=nw,
             DO_ADD=do_add,
-            DO_ADD2=do_add_2,
         )
         return y, (pref if do_add else prefix_sum)
 
@@ -510,7 +475,6 @@ def _apply_attn_res_impl(
         sw,
         y,
         hs,
-        hs2,
         pref,
         B,
         Bp,
@@ -521,7 +485,6 @@ def _apply_attn_res_impl(
         ps.stride(0),
         y.stride(0),
         hs.stride(0),
-        hs2.stride(0),
         pref.stride(0),
         BP=BP,
         BLOCK_H=BLOCK_H,
@@ -582,62 +545,18 @@ def _apply_attn_res_add_op_fake(
     return torch.empty_like(prefix_sum), torch.empty_like(prefix_sum)
 
 
-@torch.library.custom_op(
-    "atom::apply_attn_res_add2", mutates_args=(), device_types="cuda"
-)
-def _apply_attn_res_add2_op(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    score_weight: torch.Tensor,
-    eps: float,
-    add_hidden: torch.Tensor,
-    add_hidden_2: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _apply_attn_res_impl(
-        prefix_sum,
-        block_residual,
-        score_weight,
-        eps,
-        add_hidden,
-        add_hidden_2,
-    )
-
-
-@_apply_attn_res_add2_op.register_fake
-def _apply_attn_res_add2_op_fake(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    score_weight: torch.Tensor,
-    eps: float,
-    add_hidden: torch.Tensor,
-    add_hidden_2: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(prefix_sum), torch.empty_like(prefix_sum)
-
-
 def apply_attn_res(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
     score_weight: torch.Tensor,
     eps: float,
     add_hidden: torch.Tensor | None = None,
-    add_hidden_2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dispatch an opaque custom op whose CUDA implementation selects by concrete T."""
     if add_hidden is None:
-        assert add_hidden_2 is None
         return (
             _apply_attn_res_op(prefix_sum, block_residual, score_weight, eps),
             prefix_sum,
-        )
-    if add_hidden_2 is not None:
-        return _apply_attn_res_add2_op(
-            prefix_sum,
-            block_residual,
-            score_weight,
-            eps,
-            add_hidden,
-            add_hidden_2,
         )
     return _apply_attn_res_add_op(
         prefix_sum, block_residual, score_weight, eps, add_hidden
