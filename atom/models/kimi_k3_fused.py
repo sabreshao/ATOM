@@ -7,9 +7,9 @@ several separate torch ops (each a kernel launch + full HBM round-trip):
 - ``rmsnorm_gated``     : rmsnorm(x) * weight * sigmoid(gate)  (KDA o_norm)
 - ``apply_attn_res``    : block-residual soft-attention mix (attn_res boundaries)
 
-All gated behind ``ATOM_K3_FUSED`` in kimi_k3.py; the torch paths remain as the
-reference and are used when triton is unavailable. Correctness is checked in
-my_script/optest_fused.py against the torch reference.
+The activation and gated-rmsnorm kernels remain gated behind ``ATOM_K3_FUSED``
+in kimi_k3.py. ``apply_attn_res`` is the production path; correctness is checked
+against a local torch reference in my_script/optest_fused.py.
 """
 
 from __future__ import annotations
@@ -97,9 +97,11 @@ if _HAS_TRITON:
     def _attn_res_fused_kernel(
         br_ptr,
         ps_ptr,
-        nw_ptr,
-        pw_ptr,
+        sw_ptr,
         y_ptr,
+        hs_ptr,
+        hs2_ptr,
+        pref_ptr,
         B,
         Bp,
         H,
@@ -108,8 +110,15 @@ if _HAS_TRITON:
         stride_br_b,
         stride_ps_t,
         stride_yt,
+        stride_hs_t,
+        stride_hs2_t,
+        stride_pref_t,
         BP: tl.constexpr,  # Bp padded to a power of 2 (vectorized candidate axis)
         BLOCK_H: tl.constexpr,
+        NS: tl.constexpr,  # num_stages for the H-loop software pipeline
+        DO_ADD: tl.constexpr,  # fold prefix += hidden_states on-load
+        DO_ADD2: tl.constexpr,  # fold a second pending addend on-load
+        WRITE_PREF: tl.constexpr,  # write the (summed) prefix back to pref_ptr
     ):
         # One program per row t: rmsnorm each of the Bp = B+1 candidates, score =
         # <normed, score_weight>, softmax over Bp, then weighted sum -> y[t].
@@ -117,6 +126,20 @@ if _HAS_TRITON:
         # Read both source tensors directly (no torch.cat materialization); the
         # Bp axis is vectorized, so scores/probs stay in registers and softmax +
         # weighted-sum never touch HBM.
+        #
+        # DO_ADD folds the caller's ``prefix_sum = prefix_sum + hidden_states``
+        # elementwise add into the last-candidate on-load (saving a separate
+        # kernel launch + HBM round-trip); WRITE_PREF then stores that summed
+        # prefix once (first pass) so downstream layers reuse it.
+        #
+        # Two HBM passes over H: the softmax + weighted-sum combine is over the
+        # small Bp axis, so probs isn't known until the whole H-reduction is done.
+        # The second pass re-reads br/ps -- but for one row that footprint is only
+        # ~Bp*H*2B (L2-resident), so the reload is served from cache, not HBM.
+        # (Holding the [BP, H] tile in registers to avoid the reload was measured
+        # slower: it blows the VGPR file and collapses occupancy.) num_stages
+        # pipelines each pass so the next chunk's load overlaps the current
+        # reduce -- the only win at small T where occupancy alone can't hide it.
         t = tl.program_id(0)
         b_idx = tl.arange(0, BP)
         b_mask = b_idx < Bp
@@ -126,7 +149,7 @@ if _HAS_TRITON:
 
         acc_sq = tl.zeros((BP,), dtype=tl.float32)
         acc_dot = tl.zeros((BP,), dtype=tl.float32)
-        for h0 in range(0, H, BLOCK_H):
+        for h0 in tl.range(0, H, BLOCK_H, num_stages=NS):
             cols = h0 + tl.arange(0, BLOCK_H)
             h_mask = cols < H
             br = tl.load(
@@ -137,13 +160,25 @@ if _HAS_TRITON:
             ps = tl.load(ps_ptr + ps_base + cols, mask=h_mask, other=0.0).to(
                 tl.float32
             )  # [BLOCK_H]
+            if DO_ADD:
+                ps += tl.load(
+                    hs_ptr + t * stride_hs_t + cols, mask=h_mask, other=0.0
+                ).to(tl.float32)
+            if DO_ADD2:
+                ps += tl.load(
+                    hs2_ptr + t * stride_hs2_t + cols, mask=h_mask, other=0.0
+                ).to(tl.float32)
+            if WRITE_PREF:
+                tl.store(
+                    pref_ptr + t * stride_pref_t + cols,
+                    ps.to(pref_ptr.dtype.element_ty),
+                    mask=h_mask,
+                )
             v = tl.where(
                 is_last[:, None], ps[None, :], br
             )  # [BP, BLOCK_H], ps broadcast in-reg
-            # score_weight = norm_weight * proj_weight, folded in per H-chunk
-            nw = tl.load(nw_ptr + cols, mask=h_mask, other=0.0).to(tl.float32)
-            pw = tl.load(pw_ptr + cols, mask=h_mask, other=0.0).to(tl.float32)
-            sw = nw * pw
+            # score_weight = norm_weight * proj_weight, precomputed at load time
+            sw = tl.load(sw_ptr + cols, mask=h_mask, other=0.0).to(tl.float32)
             acc_sq += tl.sum(v * v, axis=1)  # [BP]
             acc_dot += tl.sum(v * sw[None, :], axis=1)  # [BP]
 
@@ -153,7 +188,7 @@ if _HAS_TRITON:
         probs = tl.exp(scores)
         probs = probs / tl.sum(probs, axis=0)  # [BP], softmax over Bp
 
-        for h0 in range(0, H, BLOCK_H):
+        for h0 in tl.range(0, H, BLOCK_H, num_stages=NS):
             cols = h0 + tl.arange(0, BLOCK_H)
             h_mask = cols < H
             br = tl.load(
@@ -162,6 +197,14 @@ if _HAS_TRITON:
                 other=0.0,
             ).to(tl.float32)
             ps = tl.load(ps_ptr + ps_base + cols, mask=h_mask, other=0.0).to(tl.float32)
+            if DO_ADD:
+                ps += tl.load(
+                    hs_ptr + t * stride_hs_t + cols, mask=h_mask, other=0.0
+                ).to(tl.float32)
+            if DO_ADD2:
+                ps += tl.load(
+                    hs2_ptr + t * stride_hs2_t + cols, mask=h_mask, other=0.0
+                ).to(tl.float32)
             v = tl.where(is_last[:, None], ps[None, :], br)
             out = tl.sum(probs[:, None] * v, axis=0)  # [BLOCK_H]
             tl.store(
@@ -170,31 +213,305 @@ if _HAS_TRITON:
                 mask=h_mask,
             )
 
+    @triton.jit
+    def _attn_res_reduce_kernel(
+        br_ptr,
+        ps_ptr,
+        sw_ptr,
+        psq_ptr,
+        pdot_ptr,
+        hs_ptr,
+        hs2_ptr,
+        pref_ptr,
+        B,
+        H,
+        S,
+        stride_br_t,
+        stride_br_b,
+        stride_ps_t,
+        stride_o_t,
+        stride_o_s,
+        stride_hs_t,
+        stride_hs2_t,
+        stride_pref_t,
+        BP: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        NS: tl.constexpr,
+        DO_ADD: tl.constexpr,
+        DO_ADD2: tl.constexpr,
+        WRITE_PREF: tl.constexpr,
+    ):
+        # Split-H stage 1, grid=(T, S): S workgroups cooperate on one row t, each
+        # owning a block-cyclic subset of the H-chunks. They emit PARTIAL sums
+        # psq/pdot[t, s] -- no softmax here, the reduction axis (H) is orthogonal
+        # to the softmax axis (Bp), so we stop strictly before the softmax fence.
+        # This multiplies the grid by S to fill the GPU at small T (where the
+        # grid=(T,) kernel launches too few workgroups to reach full occupancy).
+        #
+        # DO_ADD folds prefix += hidden_states on-load; each (t, s) owns a disjoint
+        # block-cyclic slice of H, so WRITE_PREF here stores that slice of the
+        # summed prefix with no overlap -- together the S programs cover all of H.
+        t = tl.program_id(0)
+        s = tl.program_id(1)
+        b_idx = tl.arange(0, BP)
+        is_last = b_idx == B
+        br_base = t * stride_br_t + b_idx * stride_br_b
+        ps_base = t * stride_ps_t
+        acc_sq = tl.zeros((BP,), dtype=tl.float32)
+        acc_dot = tl.zeros((BP,), dtype=tl.float32)
+        for h0 in tl.range(s * BLOCK_H, H, S * BLOCK_H, num_stages=NS):
+            cols = h0 + tl.arange(0, BLOCK_H)
+            h_mask = cols < H
+            br = tl.load(
+                br_ptr + br_base[:, None] + cols[None, :],
+                mask=(b_idx < B)[:, None] & h_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            ps = tl.load(ps_ptr + ps_base + cols, mask=h_mask, other=0.0).to(tl.float32)
+            if DO_ADD:
+                ps += tl.load(
+                    hs_ptr + t * stride_hs_t + cols, mask=h_mask, other=0.0
+                ).to(tl.float32)
+            if DO_ADD2:
+                ps += tl.load(
+                    hs2_ptr + t * stride_hs2_t + cols, mask=h_mask, other=0.0
+                ).to(tl.float32)
+            if WRITE_PREF:
+                tl.store(
+                    pref_ptr + t * stride_pref_t + cols,
+                    ps.to(pref_ptr.dtype.element_ty),
+                    mask=h_mask,
+                )
+            v = tl.where(is_last[:, None], ps[None, :], br)
+            sw = tl.load(sw_ptr + cols, mask=h_mask, other=0.0).to(tl.float32)
+            acc_sq += tl.sum(v * v, axis=1)
+            acc_dot += tl.sum(v * sw[None, :], axis=1)
+        o = t * stride_o_t + s * stride_o_s + b_idx
+        tl.store(psq_ptr + o, acc_sq)
+        tl.store(pdot_ptr + o, acc_dot)
 
-def apply_attn_res(
+    @triton.jit
+    def _attn_res_combine_kernel(
+        br_ptr,
+        ps_ptr,
+        psq_ptr,
+        pdot_ptr,
+        y_ptr,
+        hs_ptr,
+        hs2_ptr,
+        B,
+        Bp,
+        H,
+        S,
+        eps,
+        stride_br_t,
+        stride_br_b,
+        stride_ps_t,
+        stride_i_t,
+        stride_i_s,
+        stride_yt,
+        stride_hs_t,
+        stride_hs2_t,
+        BP: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        NS: tl.constexpr,
+        DO_ADD: tl.constexpr,
+        DO_ADD2: tl.constexpr,
+    ):
+        # Split-H stage 2, grid=(T,): sum the S partials back to the full
+        # H-reduction (associative, so exact), then the identical softmax +
+        # weighted-sum tail as the single-kernel path.
+        t = tl.program_id(0)
+        b_idx = tl.arange(0, BP)
+        b_mask = b_idx < Bp
+        is_last = b_idx == B
+        acc_sq = tl.zeros((BP,), dtype=tl.float32)
+        acc_dot = tl.zeros((BP,), dtype=tl.float32)
+        for s in range(S):
+            o = t * stride_i_t + s * stride_i_s + b_idx
+            acc_sq += tl.load(psq_ptr + o)
+            acc_dot += tl.load(pdot_ptr + o)
+        rstd = 1.0 / tl.sqrt(acc_sq / H + eps)
+        scores = tl.where(b_mask, rstd * acc_dot, float("-inf"))
+        scores = scores - tl.max(scores, axis=0)
+        probs = tl.exp(scores)
+        probs = probs / tl.sum(probs, axis=0)
+        br_base = t * stride_br_t + b_idx * stride_br_b
+        ps_base = t * stride_ps_t
+        for h0 in tl.range(0, H, BLOCK_H, num_stages=NS):
+            cols = h0 + tl.arange(0, BLOCK_H)
+            h_mask = cols < H
+            br = tl.load(
+                br_ptr + br_base[:, None] + cols[None, :],
+                mask=(b_idx < B)[:, None] & h_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            ps = tl.load(ps_ptr + ps_base + cols, mask=h_mask, other=0.0).to(tl.float32)
+            if DO_ADD:
+                ps += tl.load(
+                    hs_ptr + t * stride_hs_t + cols, mask=h_mask, other=0.0
+                ).to(tl.float32)
+            if DO_ADD2:
+                ps += tl.load(
+                    hs2_ptr + t * stride_hs2_t + cols, mask=h_mask, other=0.0
+                ).to(tl.float32)
+            v = tl.where(is_last[:, None], ps[None, :], br)
+            out = tl.sum(probs[:, None] * v, axis=0)
+            tl.store(
+                y_ptr + t * stride_yt + cols,
+                out.to(y_ptr.dtype.element_ty),
+                mask=h_mask,
+            )
+
+
+# Per-token-count tuning for apply_attn_res at H=7168 (gfx1250). Each bucket maps
+# an upper-bound token count to (split, S, num_stages, num_warps):
+#   split=True  -> two-kernel split-H (S workgroups per row); wins at small T by
+#                  filling the GPU that grid=(T,) leaves idle (~1.3-1.55x).
+#   split=False -> single grid=(T,) two-pass kernel with num_stages pipelining;
+#                  wins once T alone saturates the machine (the split-H partial
+#                  round-trip then becomes pure overhead).
+# Dispatch rounds T UP to the smallest bucket >= T (ceil-to-bucket), matching how
+# CUDAGraph captures a handful of fixed batch sizes; T above the largest bucket
+# falls through to the catch-all two-pass path.
+_ATTN_RES_CONFIGS = (
+    # (max_tokens, split, S, num_stages, num_warps)
+    (8, True, 7, 1, 2),
+    (16, True, 7, 1, 4),
+    (32, True, 7, 1, 4),
+    (64, True, 7, 1, 4),
+    (128, True, 6, 1, 4),
+    (256, False, 1, 2, 4),
+)
+_ATTN_RES_CATCHALL = (False, 1, 2, 4)  # T > largest bucket
+_ATTN_RES_BLOCK_H = 1024
+
+
+def _pick_attn_res_config(tokens: int):
+    for max_tokens, split, s, ns, nw in _ATTN_RES_CONFIGS:
+        if tokens <= max_tokens:
+            return split, s, ns, nw
+    return _ATTN_RES_CATCHALL
+
+
+def _apply_attn_res_impl(
     prefix_sum: torch.Tensor,  # [T, H]
     block_residual: torch.Tensor,  # [T, B, H]
-    proj_weight: torch.Tensor,  # [H] (proj.weight.squeeze(0))
-    norm_weight: torch.Tensor,  # [H]
+    score_weight: torch.Tensor,  # [H] (norm_weight * proj_weight, precomputed)
     eps: float,
-) -> torch.Tensor:
+    add_hidden: torch.Tensor | None = None,  # [T, H], folded: prefix += add_hidden
+    add_hidden_2: torch.Tensor | None = None,  # optional second folded addend
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Block-residual soft-attention mix: rmsnorm each of the B+1 candidates,
-    score = <normed, norm_weight*proj_weight>, softmax over B+1, weighted sum."""
+    score = <normed, score_weight>, softmax over B+1, weighted sum.
+
+    ``score_weight`` folds ``norm_weight * proj_weight`` once at load time (both
+    are static loaded weights), so the kernel loads a single vector instead of
+    two and drops the per-forward multiply.
+
+    When ``add_hidden`` is given, the caller's ``prefix_sum = prefix_sum +
+    hidden_states`` elementwise add is folded into the kernel (added on-load to
+    the prefix candidate, one HBM read + one launch saved) and the summed prefix
+    is written back. Returns ``(y, prefix_out)`` where ``prefix_out`` is the
+    summed prefix (or the unchanged ``prefix_sum`` when ``add_hidden`` is None),
+    so downstream layers reuse it.
+
+    Dispatches by token count (see ``_ATTN_RES_CONFIGS``): split-H at small T to
+    fill the GPU, the single-pass pipelined kernel once T saturates it."""
     T, B, H = block_residual.shape
     Bp = B + 1
-    if not _HAS_TRITON or T == 0:
-        return _apply_attn_res_torch(
-            prefix_sum, block_residual, proj_weight, norm_weight, eps
-        )
+    do_add = add_hidden is not None
+    do_add_2 = add_hidden_2 is not None
+    assert not do_add_2 or do_add
     br = block_residual.contiguous()
     ps = prefix_sum.contiguous()
+    sw = score_weight.contiguous()
     y = torch.empty((T, H), device=block_residual.device, dtype=prefix_sum.dtype)
+    # hs/pref pointers are always passed (triton needs a tensor); when not adding
+    # they alias ps and are never dereferenced (DO_ADD / WRITE_PREF are False).
+    if do_add:
+        hs = add_hidden.contiguous()
+        pref = torch.empty((T, H), device=block_residual.device, dtype=prefix_sum.dtype)
+    else:
+        hs = ps
+        pref = ps
+    hs2 = add_hidden_2.contiguous() if do_add_2 else ps
+    BP = triton.next_power_of_2(Bp)
+    BLOCK_H = _ATTN_RES_BLOCK_H
+    nchunk = triton.cdiv(H, BLOCK_H)
+
+    split, s, ns, nw = _pick_attn_res_config(T)
+    # S can't exceed the chunk count (a workgroup with no chunk to own is wasted).
+    s = min(s, nchunk)
+    if split and s > 1:
+        psq = torch.empty((T, s, BP), device=br.device, dtype=torch.float32)
+        pdot = torch.empty((T, s, BP), device=br.device, dtype=torch.float32)
+        _attn_res_reduce_kernel[(T, s)](
+            br,
+            ps,
+            sw,
+            psq,
+            pdot,
+            hs,
+            hs2,
+            pref,
+            B,
+            H,
+            s,
+            br.stride(0),
+            br.stride(1),
+            ps.stride(0),
+            psq.stride(0),
+            psq.stride(1),
+            hs.stride(0),
+            hs2.stride(0),
+            pref.stride(0),
+            BP=BP,
+            BLOCK_H=BLOCK_H,
+            NS=ns,
+            num_warps=nw,
+            DO_ADD=do_add,
+            DO_ADD2=do_add_2,
+            WRITE_PREF=do_add,
+        )
+        _attn_res_combine_kernel[(T,)](
+            br,
+            ps,
+            psq,
+            pdot,
+            y,
+            hs,
+            hs2,
+            B,
+            Bp,
+            H,
+            s,
+            eps,
+            br.stride(0),
+            br.stride(1),
+            ps.stride(0),
+            psq.stride(0),
+            psq.stride(1),
+            y.stride(0),
+            hs.stride(0),
+            hs2.stride(0),
+            BP=BP,
+            BLOCK_H=BLOCK_H,
+            NS=ns,
+            num_warps=nw,
+            DO_ADD=do_add,
+            DO_ADD2=do_add_2,
+        )
+        return y, (pref if do_add else prefix_sum)
+
     _attn_res_fused_kernel[(T,)](
         br,
         ps,
-        norm_weight.contiguous(),
-        proj_weight.contiguous(),
+        sw,
         y,
+        hs,
+        hs2,
+        pref,
         B,
         Bp,
         H,
@@ -203,21 +520,128 @@ def apply_attn_res(
         br.stride(1),
         ps.stride(0),
         y.stride(0),
-        BP=triton.next_power_of_2(Bp),
-        BLOCK_H=1024,
+        hs.stride(0),
+        hs2.stride(0),
+        pref.stride(0),
+        BP=BP,
+        BLOCK_H=BLOCK_H,
+        NS=ns,
+        num_warps=nw,
+        DO_ADD=do_add,
+        WRITE_PREF=do_add,
     )
-    return y
+    return y, (pref if do_add else prefix_sum)
 
 
-def _apply_attn_res_torch(prefix_sum, block_residual, proj_weight, norm_weight, eps):
-    values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-    values_f = values.float()
-    var = values_f.pow(2).mean(-1, keepdim=True)
-    normed = values_f * torch.rsqrt(var + eps)
-    score_weight = norm_weight.float() * proj_weight.float()
-    scores = (normed * score_weight).sum(-1)
-    probs = scores.softmax(-1).unsqueeze(1)
-    return torch.matmul(probs, values_f).squeeze(1).to(prefix_sum.dtype)
+@torch.library.custom_op("atom::apply_attn_res", mutates_args=(), device_types="cuda")
+def _apply_attn_res_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    mixed_output, _ = _apply_attn_res_impl(
+        prefix_sum, block_residual, score_weight, eps
+    )
+    return mixed_output
+
+
+@_apply_attn_res_op.register_fake
+def _apply_attn_res_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    return torch.empty_like(prefix_sum)
+
+
+@torch.library.custom_op(
+    "atom::apply_attn_res_add", mutates_args=(), device_types="cuda"
+)
+def _apply_attn_res_add_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _apply_attn_res_impl(
+        prefix_sum, block_residual, score_weight, eps, add_hidden
+    )
+
+
+@_apply_attn_res_add_op.register_fake
+def _apply_attn_res_add_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(prefix_sum), torch.empty_like(prefix_sum)
+
+
+@torch.library.custom_op(
+    "atom::apply_attn_res_add2", mutates_args=(), device_types="cuda"
+)
+def _apply_attn_res_add2_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor,
+    add_hidden_2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _apply_attn_res_impl(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        add_hidden_2,
+    )
+
+
+@_apply_attn_res_add2_op.register_fake
+def _apply_attn_res_add2_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor,
+    add_hidden_2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(prefix_sum), torch.empty_like(prefix_sum)
+
+
+def apply_attn_res(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor | None = None,
+    add_hidden_2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch an opaque custom op whose CUDA implementation selects by concrete T."""
+    if add_hidden is None:
+        assert add_hidden_2 is None
+        return (
+            _apply_attn_res_op(prefix_sum, block_residual, score_weight, eps),
+            prefix_sum,
+        )
+    if add_hidden_2 is not None:
+        return _apply_attn_res_add2_op(
+            prefix_sum,
+            block_residual,
+            score_weight,
+            eps,
+            add_hidden,
+            add_hidden_2,
+        )
+    return _apply_attn_res_add_op(
+        prefix_sum, block_residual, score_weight, eps, add_hidden
+    )
 
 
 def situ_and_mul(
@@ -491,4 +915,3 @@ def fuse_mla_kv(
         BLOCK=BLOCK,
     )
     return k, v_padded
-
