@@ -1069,13 +1069,28 @@ class KimiDecoderLayer(nn.Module):
             return self.block_sparse_moe(hidden_states)
         return self.mlp(hidden_states)
 
+    def process_weights_after_loading(self) -> None:
+        # Fold each attn-residual (norm.weight * proj.weight) into a single
+        # static score vector consumed by apply_attn_res (see
+        # _attn_res_score_weight). Both operands are load-time constants.
+        if not self.use_attn_residuals:
+            return
+        for proj, norm in (
+            (self.self_attention_res_proj, self.self_attention_res_norm),
+            (self.mlp_res_proj, self.mlp_res_norm),
+        ):
+            proj.score_weight = _attn_res_score_weight(proj, norm)
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor | None = None,
+        pending_add: torch.Tensor | None = None,
     ):
         if not self.use_attn_residuals:
+            if pending_add is not None:
+                hidden_states = hidden_states + pending_add
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
             if self.is_linear_attn:
@@ -1086,16 +1101,20 @@ class KimiDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self._ffn(hidden_states)
-            return residual + hidden_states, block_residual
+            return residual + hidden_states, None, block_residual
 
         prefix_sum = hidden_states
         if block_residual is not None and block_residual.shape[1] > 0:
-            hidden_states = _apply_attn_res(
+            hidden_states, prefix_sum = _apply_attn_res(
                 prefix_sum,
                 block_residual,
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
+                add_hidden=pending_add,
             )
+        elif pending_add is not None:
+            prefix_sum = prefix_sum + pending_add
+            hidden_states = prefix_sum
         if self.layer_idx % self.attn_res_block_size == 0:
             assert block_residual is not None
             block_residual = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
@@ -1106,15 +1125,37 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = self.self_attn(hidden_states)
         else:
             hidden_states = self.self_attn(positions, hidden_states)
-        prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
 
-        hidden_states = _apply_attn_res(
-            prefix_sum, block_residual, self.mlp_res_proj, self.mlp_res_norm
-        )
+        if prefix_sum is None:
+            prefix_sum = hidden_states
+            hidden_states, prefix_sum = _apply_attn_res(
+                prefix_sum, block_residual, self.mlp_res_proj, self.mlp_res_norm
+            )
+        else:
+            # Fold prefix_sum = prefix_sum + hidden_states into the fused kernel.
+            hidden_states, prefix_sum = _apply_attn_res(
+                prefix_sum,
+                block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                add_hidden=hidden_states,
+            )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self._ffn(hidden_states)
-        prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
-        return prefix_sum, block_residual
+        if prefix_sum is None:
+            return hidden_states, None, block_residual
+        return prefix_sum, hidden_states, block_residual
+
+
+def _attn_res_score_weight(proj: ReplicatedLinear, norm: RMSNorm) -> torch.Tensor:
+    """Fold the static rmsnorm gain and projection into one [H] score vector.
+
+    Both operands are load-time constants, so this is precomputed once in
+    ``process_weights_after_loading`` and cached on ``proj.score_weight``; the
+    apply_attn_res kernel then reads a single vector per H-chunk instead of
+    reloading norm.weight and proj.weight and multiplying them every forward.
+    """
+    return (norm.weight.float() * proj.weight.squeeze(0).float()).contiguous()
 
 
 def _apply_attn_res(
@@ -1122,23 +1163,18 @@ def _apply_attn_res(
     block_residual: torch.Tensor,
     proj: ReplicatedLinear,
     norm: RMSNorm,
-) -> torch.Tensor:
+    add_hidden: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Returns (mixed_output, prefix_out). When add_hidden is given the fused path
+    # folds ``prefix_sum = prefix_sum + add_hidden`` into the kernel and returns
+    # the summed prefix; otherwise prefix_out is prefix_sum unchanged.
     eps = getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6))
-    if os.environ.get("ATOM_K3_FUSED", "1") == "1":
-        from atom.models.kimi_k3_fused import apply_attn_res
+    score_weight = getattr(proj, "score_weight", None)
+    if score_weight is None:
+        score_weight = _attn_res_score_weight(proj, norm)
+    from atom.models.kimi_k3_fused import apply_attn_res
 
-        return apply_attn_res(
-            prefix_sum, block_residual, proj.weight.squeeze(0), norm.weight, eps
-        )
-    values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-    values_f = values.float()
-    var = values_f.pow(2).mean(-1, keepdim=True)
-    eps = getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6))
-    normed = values_f * torch.rsqrt(var + eps)
-    score_weight = norm.weight.float() * proj.weight.squeeze(0).float()
-    scores = (normed * score_weight).sum(-1)
-    probs = scores.softmax(-1).unsqueeze(1)
-    return torch.matmul(probs, values_f).squeeze(1).to(prefix_sum.dtype)
+    return apply_attn_res(prefix_sum, block_residual, score_weight, eps, add_hidden)
 
 
 @support_torch_compile
@@ -1198,6 +1234,15 @@ class KimiLinearModel(nn.Module):
             ["hidden_states", "block_residual"], config.hidden_size
         )
 
+    def process_weights_after_loading(self) -> None:
+        # Fold the final output attn-residual (norm.weight * proj.weight) into a
+        # single static score vector for apply_attn_res. Present only on the last
+        # PP rank when attn residuals are enabled.
+        if hasattr(self, "output_attn_res_proj"):
+            self.output_attn_res_proj.score_weight = _attn_res_score_weight(
+                self.output_attn_res_proj, self.output_attn_res_norm
+            )
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1226,22 +1271,31 @@ class KimiLinearModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             block_residual = intermediate_tensors["block_residual"]
 
+        pending_add = None
         for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, block_residual = layer(
-                positions, hidden_states, block_residual
+            hidden_states, pending_add, block_residual = layer(
+                positions,
+                hidden_states,
+                block_residual,
+                pending_add=pending_add,
             )
 
         if not get_pp_group().is_last_rank:
+            if pending_add is not None:
+                hidden_states = hidden_states + pending_add
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "block_residual": block_residual}
             )
         if getattr(self.config, "attn_res_block_size", None) is not None:
-            hidden_states = _apply_attn_res(
+            hidden_states, _ = _apply_attn_res(
                 hidden_states,
                 block_residual,
                 self.output_attn_res_proj,
                 self.output_attn_res_norm,
+                add_hidden=pending_add,
             )
+        elif pending_add is not None:
+            hidden_states = hidden_states + pending_add
         return self.norm(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
