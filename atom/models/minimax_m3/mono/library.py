@@ -51,7 +51,17 @@ __all__ = [
     "TPContext",
     "validate_layer",
 ]
-SUPPORTED_TOKENS = (1, 4, 8, 16)
+MAX_TOKENS = 16  # the MFMA B operand holds 16 rows
+MAX_REQUESTS = 16  # the metadata buffers are sized for this many rows
+# The qualified context ceiling. Not a kernel limit -- native mono runs to 1M --
+# but the bound above which the scalar-scale FP8 caches are untested.
+MAX_CONTEXT = 131072
+SUPPORTED_TOKENS = tuple(range(1, MAX_TOKENS + 1))
+
+
+def divisors(n: int) -> list[int]:
+    """The query lengths an n-row step can be split into."""
+    return [q for q in range(1, n + 1) if n % q == 0]
 _RUNTIMES = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
 
@@ -188,11 +198,20 @@ class AtomM3Mono:
         layer_specs: list[LayerSpec],
         cache_specs: list[CacheSpec],
         tp_context: TPContext,
+        widths: tuple[int, ...] = SUPPORTED_TOKENS,
+        max_context: int = MAX_CONTEXT,
     ):
+        """``widths`` are the step sizes compiled eagerly at construction; pass
+        the capture ladder the engine will actually replay rather than all of
+        1..MAX_TOKENS, since each width is a separate kernel build. A width not
+        listed here is refused at ``prepare_step``, not compiled on demand:
+        compiling inside a graph capture is not possible."""
         self.tp = tp_context
         self.closed = False
         self._step = None
         self._handle = next(_HANDLES)
+        self.widths = tuple(sorted(set(widths)))
+        self.max_context = max_context
         bind_agreed(lambda: self._bind(layer_specs, cache_specs), self.tp.cpu_group)
         self.execution = SparseExecution(
             self.weights,
@@ -210,7 +229,7 @@ class AtomM3Mono:
                 self.tp.cpu_group,
                 "MiniMax-M3 tensor library",
             )
-            for n in SUPPORTED_TOKENS:
+            for n in self.widths:
                 require(self.builds.prepare(n), f"compilation failed for {n} rows")
             bind_agreed(self._warm_metadata, self.tp.cpu_group)
         except Exception:
@@ -273,8 +292,17 @@ class AtomM3Mono:
         require(
             len({c.max_context for c in caches}) == 1, "cache capacities must agree"
         )
+        # One build serves the step, so every layer must address its cache the
+        # same way; the layout decides the main_table scaling.
+        require(
+            len({c.layout for c in caches}) == 1, "cache layouts must agree"
+        )
+        require(
+            self.widths and set(self.widths) <= set(SUPPORTED_TOKENS),
+            f"widths must be a non-empty subset of 1..{MAX_TOKENS}; got {self.widths}",
+        )
         for cache in caches:
-            validate_cache(cache, self.tp.device)
+            validate_cache(cache, self.tp.device, self.max_context)
         self.caches = list(caches)
         self.width = triton.next_power_of_2((caches[0].max_context + 127) // 128)
         for spec in specs:
@@ -311,12 +339,12 @@ class AtomM3Mono:
         def zeros(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=self.tp.device)
 
-        self.main_table = zeros((16, self.width), torch.int32)
-        self.index_table = zeros((16, self.width), torch.int32)
-        self.seq_lens = zeros((16,), torch.int32)
-        self.main_slots = zeros((16,), torch.int64)
-        self.index_slots = zeros((16,), torch.int64)
-        self.batch_ids = zeros((16,), torch.int32)
+        self.main_table = zeros((MAX_REQUESTS, self.width), torch.int32)
+        self.index_table = zeros((MAX_REQUESTS, self.width), torch.int32)
+        self.seq_lens = zeros((MAX_REQUESTS,), torch.int32)
+        self.main_slots = zeros((MAX_TOKENS,), torch.int64)
+        self.index_slots = zeros((MAX_TOKENS,), torch.int64)
+        self.batch_ids = zeros((MAX_TOKENS,), torch.int32)
         self.cache_args = torch.tensor(
             [self.index_slots.data_ptr(), self.index_table.data_ptr(), self.width],
             dtype=torch.int64,
@@ -357,16 +385,22 @@ class AtomM3Mono:
 
     def _warm_metadata(self):
         # Use independent dummy inputs; never touch native cache storage.
-        lengths = torch.ones(4, dtype=torch.int32, device=self.tp.device)
-        slots = torch.full((16,), -1, dtype=torch.int64, device=self.tp.device)
-        table = torch.zeros((4, self.width), dtype=torch.int32, device=self.tp.device)
-        for rows in (1, 2, 3, 4):
-            for query_len in (1, 4):
-                self._expand(
-                    StepMetadata(
-                        table, table, lengths[:rows], slots, slots, 16, query_len
-                    )
+        # _token_rows specializes on (query_len, width), so one warm per query
+        # length the configured widths can produce covers every step shape.
+        lengths = torch.ones(MAX_REQUESTS, dtype=torch.int32, device=self.tp.device)
+        slots = torch.full(
+            (MAX_TOKENS,), -1, dtype=torch.int64, device=self.tp.device
+        )
+        table = torch.zeros(
+            (MAX_REQUESTS, self.width), dtype=torch.int32, device=self.tp.device
+        )
+        for query_len in sorted({q for n in self.widths for q in divisors(n)}):
+            rows = min(max(self.widths) // query_len, MAX_REQUESTS)
+            self._expand(
+                StepMetadata(
+                    table, table, lengths[:rows], slots, slots, MAX_TOKENS, query_len
                 )
+            )
         with compile_only():
             self.execution.mailboxes.begin_step()
         torch.cuda.synchronize(self.tp.device)
@@ -378,14 +412,16 @@ class AtomM3Mono:
         )
         require(not self.closed, "runtime is closed")
         require(
-            metadata.token_count in SUPPORTED_TOKENS
-            and metadata.query_len in (1, 4)
+            metadata.token_count in self.widths
+            and 1 <= metadata.query_len <= metadata.token_count
             and metadata.token_count % metadata.query_len == 0,
-            "unsupported step shape",
+            f"unsupported step shape: {metadata.token_count} rows of "
+            f"query length {metadata.query_len}, built widths {self.widths}",
         )
         require(
-            metadata.seq_lens.ndim == 1 and metadata.seq_lens.numel() <= 4,
-            "requires at most four request rows",
+            metadata.seq_lens.ndim == 1
+            and metadata.seq_lens.numel() <= MAX_REQUESTS,
+            f"requires at most {MAX_REQUESTS} request rows",
         )
         for table in (metadata.main_table, metadata.index_table):
             require(
@@ -471,7 +507,10 @@ class AtomM3Mono:
             res_out,
             [*self._weights[i], cache.k_scale, cache.v_scale],
             self.resources,
-            [cache.main, cache.index],
+            # The storage the kernel reads and writes, so the dispatcher sees
+            # it as mutated. k and v are the planes in both layouts; under the
+            # packed layout they are views of main and cover the same storage.
+            [cache.k, cache.v, cache.index],
             self._handle,
             i,
             query_len,

@@ -26,12 +26,12 @@ import torch
 import torch.distributed as dist
 
 from atom.models.minimax_m3.mono.library import (
-    SUPPORTED_TOKENS,
     AtomM3Mono,
     CacheSpec,
     LayerSpec,
     StepMetadata,
     TPContext,
+    divisors,
 )
 
 HIDDEN = 6144
@@ -45,7 +45,6 @@ ROTARY = 64
 UNIT_E8M0 = 127  # the scale code of 1.0
 LAYER_ID = 3
 BLOCKS = 512
-PAGE_SLOTS = 256  # a main block holds 128 K and 128 V token slots
 
 
 def fp8(shape, dev, scale=0.05):
@@ -67,8 +66,10 @@ def bf16(shape, dev, scale=1.0):
     return (torch.randn(shape, device=dev) * scale).bfloat16()
 
 
-def make_layer(dev) -> LayerSpec:
-    pos = torch.arange(4096, device=dev, dtype=torch.float32)[:, None]
+def make_layer(dev, max_position) -> LayerSpec:
+    # Must cover every position the step uses; the kernel indexes this
+    # table by position and reads past the end without complaining.
+    pos = torch.arange(max_position, device=dev, dtype=torch.float32)[:, None]
     freq = pos / 10000.0 ** (torch.arange(32, device=dev) / 32.0)[None, :]
     cos_sin = torch.cat([freq.cos(), freq.sin()], dim=1).bfloat16()
     assert cos_sin.shape[1] == ROTARY
@@ -94,22 +95,43 @@ def make_layer(dev) -> LayerSpec:
     )
 
 
-def make_cache(dev):
-    main = torch.zeros((BLOCKS, 2, 128, 128), dtype=torch.float8_e4m3fn, device=dev)
-    index = torch.zeros((BLOCKS, 128, 128), dtype=torch.float8_e4m3fn, device=dev)
+def make_cache(dev, layout, blocks, max_context):
+    """(main planes, index, spec, page16 pages a 128-token block).
+
+    The two layouts differ only in where K and V live, so the planes are
+    returned as a tuple and everything downstream is written per plane.
+    """
+    index = torch.zeros((blocks, 128, 128), dtype=torch.float8_e4m3fn, device=dev)
     one = torch.ones(1, dtype=torch.float32, device=dev)
-    return main, index, CacheSpec(
-        LAYER_ID,
-        main,
-        main.view(-1, 1, 8, 16, 16),
-        main.view(-1, 1, 1, 128, 16)[8:],
-        index,
-        one,
-        one.clone(),
+    if layout == "packed_page16_scalar_fp8":
+        main = torch.zeros(
+            (blocks, 2, 128, 128), dtype=torch.float8_e4m3fn, device=dev
+        )
+        spec = CacheSpec(
+            LAYER_ID,
+            main,
+            main.view(-1, 1, 8, 16, 16),
+            main.view(-1, 1, 1, 128, 16)[8:],
+            index,
+            one,
+            one.clone(),
+            max_context=max_context,
+            layout=layout,
+        )
+        return (main,), index, spec, 16
+    k = torch.zeros((blocks * 8, 16, 128), dtype=torch.float8_e4m3fn, device=dev)
+    v = torch.zeros_like(k)
+    spec = CacheSpec(
+        LAYER_ID, None, k, v, index, one, one.clone(),
+        max_context=max_context, layout=layout,
     )
+    return (k, v), index, spec, 8
 
 
-def run_width(runtime, dev, main, index, tokens, query_len, context, log):
+def run_width(
+    runtime, dev, planes, index, pages_per_block, tokens, query_len, context,
+    layout, log,
+):
     """One step width: eager, then a graph replayed over two cache placements,
     then the same graph with the tail rows padded out and poisoned.
 
@@ -119,7 +141,7 @@ def run_width(runtime, dev, main, index, tokens, query_len, context, log):
     reqs = tokens // query_len
     width = (context + 127) // 128
     # Fixed addresses: a captured graph reads these same buffers on every replay.
-    mt = torch.zeros((reqs, 128), dtype=torch.int32, device=dev)
+    mt = torch.zeros((reqs, width), dtype=torch.int32, device=dev)
     it = torch.zeros_like(mt)
     lens = torch.full((reqs,), context, dtype=torch.int32, device=dev)
     slots = torch.empty(tokens, dtype=torch.int64, device=dev)
@@ -134,29 +156,39 @@ def run_width(runtime, dev, main, index, tokens, query_len, context, log):
 
     # Each request gets its own physical range, so no two write the same slot.
     span = reqs * width
-    payload_main = torch.randint(
-        0, 64, (span, 2, 128, 128), dtype=torch.uint8, device=dev
-    ).view(torch.float8_e4m3fn)
+    # A plane's first dimension counts rows per 128-token block: 1 for packed
+    # main, 8 for a split K or V plane.
+    blocks_total = planes[0].shape[0] // (1 if planes[0].ndim == 4 else 8)
+    per_block = [plane.shape[0] // blocks_total for plane in planes]
+    payloads = [
+        torch.randint(
+            0, 64, (span * rpb, *plane.shape[1:]), dtype=torch.uint8, device=dev
+        ).view(torch.float8_e4m3fn)
+        for plane, rpb in zip(planes, per_block)
+    ]
     payload_index = torch.randint(
         0, 64, (span, 128, 128), dtype=torch.uint8, device=dev
     ).view(torch.float8_e4m3fn)
     blocks = torch.arange(width, device=dev, dtype=torch.int32)
     req_of = torch.arange(tokens, device=dev, dtype=torch.int64) // query_len
+    # stage_split reads page = entry * 8 + sub, so the entry carries whatever
+    # scaling the layout's pages-per-block implies.
+    entry_scale = pages_per_block // 8
 
     def place(shift):
-        """Put the same payload at a different offset in both caches. 0x7F is
+        """Put the same payload at a different offset in every cache. 0x7F is
         E4M3 NaN: anything read outside the payload shows up as a NaN output."""
         mbase, ibase = 7 + shift, 101 + shift
-        main.view(torch.uint8).fill_(0x7F)
+        for plane, rpb, payload in zip(planes, per_block, payloads):
+            plane.view(torch.uint8).fill_(0x7F)
+            plane[mbase * rpb : (mbase + span) * rpb].copy_(payload)
         index.view(torch.uint8).fill_(0x7F)
-        main[mbase : mbase + span].copy_(payload_main)
         index[ibase : ibase + span].copy_(payload_index)
         rows = torch.arange(reqs, device=dev, dtype=torch.int32)[:, None] * width
-        # packed layout: a main block spans 16 page16 pages, so the table is x2
-        mt[:, :width] = (rows + blocks + mbase) * 2
+        mt[:, :width] = (rows + blocks + mbase) * entry_scale
         it[:, :width] = rows + blocks + ibase
         phys = mbase + req_of * width + tok // 128
-        slots.copy_(phys * PAGE_SLOTS + tok % 128)
+        slots.copy_(phys * (pages_per_block * 16) + tok % 128)
         islots.copy_((ibase + req_of * width + tok // 128) * 128 + tok % 128)
 
     def forward():
@@ -203,6 +235,7 @@ def run_width(runtime, dev, main, index, tokens, query_len, context, log):
     graph.reset()
     log.append(
         {
+            "layout": layout,
             "tokens": tokens,
             "query_len": query_len,
             "requests": reqs,
@@ -218,9 +251,18 @@ def main():
     p = argparse.ArgumentParser()
     # Small enough that every request's own block range fits in BLOCKS.
     p.add_argument("--context", type=int, default=1024)
-    # The library refuses more rows than this ("requires at most four request
-    # rows"); raise it together with that bound.
-    p.add_argument("--max-requests", type=int, default=4)
+    p.add_argument("--max-requests", type=int, default=16)
+    p.add_argument(
+        "--layout",
+        default="split_kv_scalar_fp8",
+        choices=("packed_page16_scalar_fp8", "split_kv_scalar_fp8"),
+    )
+    # Comma-separated step widths to build; all of 1..16 when unset. Each is a
+    # separate kernel build, so narrow it when iterating.
+    p.add_argument("--widths", default="1,4,8,16")
+    # CacheSpec.max_context: the block-table width the runtime sizes for.
+    p.add_argument("--max-context", type=int, default=16384)
+    p.add_argument("--blocks", type=int, default=BLOCKS)
     args = p.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
@@ -228,20 +270,29 @@ def main():
     dist.init_process_group("gloo", timeout=timedelta(seconds=600))
     dev = torch.device("cuda", rank)
 
-    spec = make_layer(dev)
-    main, index, cache = make_cache(dev)
-    runtime = AtomM3Mono([spec], [cache], TPContext(dist.group.WORLD, rank, 4, dev))
+    spec = make_layer(dev, args.context + 1)
+    planes, index, cache, pages_per_block = make_cache(
+        dev, args.layout, args.blocks, args.max_context
+    )
+    widths = tuple(int(w) for w in args.widths.split(",")) if args.widths else None
+    runtime = AtomM3Mono(
+        [spec],
+        [cache],
+        TPContext(dist.group.WORLD, rank, 4, dev),
+        **({"widths": widths} if widths else {}),
+    )
     log = []
     try:
         skipped = []
-        for tokens in SUPPORTED_TOKENS:
-            for query_len in (1, 4):
-                if tokens % query_len:
-                    continue
+        for tokens in runtime.widths:
+            for query_len in divisors(tokens):
                 if tokens // query_len > args.max_requests:
                     skipped.append((tokens, query_len))
                     continue
-                run_width(runtime, dev, main, index, tokens, query_len, args.context, log)
+                run_width(
+                    runtime, dev, planes, index, pages_per_block,
+                    tokens, query_len, args.context, args.layout, log,
+                )
                 if rank == 0:
                     print(log[-1], flush=True)
     finally:

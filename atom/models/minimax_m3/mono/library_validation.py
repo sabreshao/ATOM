@@ -55,11 +55,17 @@ def validate_layer(spec: LayerSpec, device: torch.device) -> None:
     check(spec.s2, "s2", (129, 6144, 24), torch.uint8)
 
 
-def validate_cache(cache: CacheSpec, device: torch.device):
-    require(cache.layout == "packed_page16_scalar_fp8", "unsupported cache layout")
+PACKED = "packed_page16_scalar_fp8"
+SPLIT = "split_kv_scalar_fp8"
+PAGE_BYTES = 16 * 128  # a page16 page: 16 tokens, 128 dims, one byte each
+
+
+def _validate_packed_kv(cache: CacheSpec, device: torch.device) -> None:
+    """K and V in one allocation, V pre-offset by eight pages."""
     main, k, v = cache.main, cache.k, cache.v
     require(
-        main.ndim == 4
+        main is not None
+        and main.ndim == 4
         and tuple(main.shape[1:]) == (2, 128, 128)
         and main.shape[0] > 0
         and main.element_size() == 1
@@ -75,11 +81,51 @@ def validate_cache(cache: CacheSpec, device: torch.device):
         and k.shape[0] == main.shape[0] * 16
         and v.shape[0] == k.shape[0] - 8
         and k.data_ptr() == main.data_ptr()
-        and v.data_ptr() - k.data_ptr() == 8 * 16 * 128
+        and v.data_ptr() - k.data_ptr() == 8 * PAGE_BYTES
         and k.untyped_storage().data_ptr() == main.untyped_storage().data_ptr()
         and v.untyped_storage().data_ptr() == main.untyped_storage().data_ptr(),
         "page16 K/V views must share native storage",
     )
+
+
+def _validate_split_kv(cache: CacheSpec, device: torch.device) -> None:
+    """K and V independently allocated, each a whole number of page16 pages.
+
+    The tile interior is unchecked and unchangeable: a K page is
+    [d/16][t][d%16] and a V page is [d][t]. A token-major pool passes every
+    check here and then reads the wrong bytes, so the caller owns that
+    guarantee -- see the layout note in CacheSpec.
+    """
+    k, v = cache.k, cache.v
+    require(cache.main is None, "split layout has no packed main storage")
+    for name, t in (("k", k), ("v", v)):
+        require(
+            t.dtype == torch.float8_e4m3fn
+            and t.device == device
+            and t.is_contiguous()
+            and t.data_ptr() % 16 == 0
+            and t.numel() > 0
+            and t.numel() % PAGE_BYTES == 0,
+            f"{name} cache must be contiguous aligned E4M3 of whole page16 pages; "
+            f"got {tuple(t.shape)} {t.dtype} {t.device}",
+        )
+    require(
+        k.numel() == v.numel(),
+        f"k and v must hold the same page count; got {k.numel() // PAGE_BYTES} "
+        f"and {v.numel() // PAGE_BYTES}",
+    )
+
+
+def validate_cache(cache: CacheSpec, device: torch.device, max_context: int):
+    """``max_context`` is the caller's qualified ceiling, not a kernel limit."""
+    require(
+        cache.layout in (PACKED, SPLIT),
+        f"unsupported cache layout {cache.layout!r}",
+    )
+    if cache.layout == PACKED:
+        _validate_packed_kv(cache, device)
+    else:
+        _validate_split_kv(cache, device)
     checked_tensor(
         cache.index,
         "index cache",
@@ -98,6 +144,7 @@ def validate_cache(cache: CacheSpec, device: torch.device):
             "cache scale must be a positive finite FP32 scalar",
         )
     require(
-        0 < cache.max_context <= 16384,
-        "context capacity exceeds scalar-cache qualification",
+        0 < cache.max_context <= max_context,
+        f"context capacity {cache.max_context} exceeds the qualified "
+        f"{max_context}",
     )

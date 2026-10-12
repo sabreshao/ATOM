@@ -59,15 +59,26 @@ class LayerSpec:
 class CacheSpec:
     """Native FP8 main/index storage with independent allocation.
 
-    main is [blocks, 2, 128, 128]. k/v are the native page16 shuffle views:
-    K starts at main, V starts 8 pages later, and each main block spans 16
-    physical pages. Scales are positive FP32 scalars. Index storage is
+    Two layouts, differing only in where K and V live. The page16 tile interior
+    is the same in both and is AITER SHUFFLE, not token-major: a K page is
+    [d/16][t][d%16] over 16 tokens and 128 dims, a V page is [d][t]. A caller
+    whose pool is token-major cannot be served by either layout.
+
+    ``packed_page16_scalar_fp8``: K and V share one allocation. main is
+    [blocks, 2, 128, 128], k starts at main, v starts 8 pages later, and each
+    main block spans 16 physical pages. ``main_table`` entries are block * 2.
+
+    ``split_kv_scalar_fp8``: k and v are independently allocated, each
+    [blocks * 8] page16 pages; main is unused and may be None.
+    ``main_table`` entries are the block itself.
+
+    Scales are positive FP32 scalars in both. Index storage is
     [index_blocks, 128, 128] E4M3. All storage and scales must remain stable
     until captured graphs are destroyed and the runtime has closed.
     """
 
     layer_id: int
-    main: torch.Tensor
+    main: torch.Tensor | None
     k: torch.Tensor
     v: torch.Tensor
     index: torch.Tensor
@@ -81,11 +92,16 @@ class CacheSpec:
 class StepMetadata:
     """A uniform decode/verify batch, padded to token_count rows.
 
-    Tables have one row per request. main_table entries are physical main
-    block IDs * 2 (each expands to eight page16 IDs); index_table entries
-    are physical 128-token index block IDs. seq_lens includes all query tokens.
-    Slots have one entry per padded token: main_slots are page16 token
-    addresses, index_slots independently address index storage; -1 is padding.
+    Tables have one row per request. A main_table entry is scaled so that
+    entry * 8 + sub is the physical page16 page: under
+    ``packed_page16_scalar_fp8`` that makes it the main block ID * 2 (sixteen
+    pages a block, K then V), under ``split_kv_scalar_fp8`` the block ID itself
+    (eight pages a block in each of the two allocations). index_table entries
+    are physical 128-token index block IDs in both.
+
+    seq_lens includes all query tokens. Slots have one entry per padded token:
+    main_slots are page16 token addresses (page * 16 + token-in-page),
+    index_slots independently address index storage; -1 is padding.
     query_len is the uniform tokens per request, including padded requests.
     """
 
